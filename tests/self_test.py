@@ -15,6 +15,13 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求排空
+  15. 未知节点管理接口 404
+  16. 配置单调读：版本门控生效，无门槛 GET 保持原行为
+  17. 选路后版本回退：拒绝交付旧版、更新选路依据、改投合格节点
+  18. 副本追赶：周期版本探测自动恢复候选资格（落后不算故障）
+  19. 排空与版本检查交错：排空节点不收版本探测、在途版本请求计入排空等待
+  20. 缺版本头响应：拒绝交付并排除，恢复发头后重新成为候选
 """
 from __future__ import annotations
 
@@ -50,14 +57,15 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  [FAIL] {name} {detail}")
 
 
-def http(method: str, url: str, timeout: float = 20.0, data: bytes | None = None):
-    """返回 (status, headers, body_text)。4xx/5xx 不抛异常。"""
-    req = urllib.request.Request(url, method=method, data=data)
+def http(method: str, url: str, timeout: float = 20.0, data: bytes | None = None,
+         headers: dict | None = None):
+    """返回 (status, headers, body_text)。4xx/5xx 不抛异常。响应头键统一小写。"""
+    req = urllib.request.Request(url, method=method, data=data, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, dict(resp.headers), resp.read().decode()
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read().decode()
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read().decode()
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read().decode()
 
 
 def jget(url: str, timeout: float = 20.0):
@@ -118,6 +126,22 @@ def node_status(node: str) -> dict:
 def set_mode(port: int, mode: str) -> None:
     status, _, body = http("POST", f"http://127.0.0.1:{port}/control/mode?mode={mode}")
     assert status == 200, body
+
+
+def set_config(port: int, version: int, omit: bool | None = None) -> None:
+    """直连上游调整配置版本（可升可降）；omit=True 时响应不再带版本头。"""
+    q = f"version={version}"
+    if omit is not None:
+        q += f"&omit_version={'true' if omit else 'false'}"
+    status, _, body = http("POST", f"http://127.0.0.1:{port}/control/config?{q}")
+    assert status == 200, body
+
+
+def get_config(min_version: int | None = None, query: str = "", timeout: float = 20.0):
+    """经网关 GET /proxy/config，可带 X-Min-Version。返回 (status, headers, body)。"""
+    headers = {"X-Min-Version": str(min_version)} if min_version is not None else None
+    return http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/config{query}",
+                timeout=timeout, headers=headers)
 
 
 def main() -> int:
@@ -414,6 +438,201 @@ def main() -> int:
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+
+        # 16. 配置单调读：版本门控生效；不带门槛的 GET 保持原行为
+        print("== 16. 配置单调读：版本门控 ==")
+        for name in ("node1", "node2"):
+            status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/{name}/resume")
+            assert status == 200, body
+        set_config(U1_PORT, 5)
+        set_config(U2_PORT, 3)
+        time.sleep(1.6)  # 等周期版本探测刷新两节点版本
+        st1, st2 = node_status("node1"), node_status("node2")
+        check("网关已跟踪两副本配置版本",
+              st1["config_version"] == 5 and st2["config_version"] == 3,
+              f"node1={st1['config_version']} node2={st2['config_version']}")
+        # 无门槛：两节点轮询，较低版本照样交付（原行为）
+        seen, versions = set(), set()
+        for _ in range(2):
+            s, h, b = get_config()
+            assert s == 200, b
+            seen.add(json.loads(b)["node"])
+            versions.add(h.get("x-config-version"))
+        check("无门槛请求仍在两节点间轮询", seen == {"node1", "node2"}, str(seen))
+        check("无门槛请求透传各自版本头（含较低版本）", versions == {"5", "3"}, str(versions))
+        # 门槛 4：只有 node1(v5) 合格
+        seen = set()
+        for _ in range(3):
+            s, h, b = get_config(min_version=4)
+            assert s == 200 and h.get("x-config-version") == "5", f"{s} {h} {b}"
+            seen.add(json.loads(b)["node"])
+        check("门槛 4 的请求全部落在 node1(v5)", seen == {"node1"}, str(seen))
+        # 门槛 6：超过所有副本 -> 明确 503 暂不可读，不交付旧配置
+        s, h, b = get_config(min_version=6)
+        check("门槛超过全部副本返回 503", s == 503, f"status={s} body={b}")
+        check("503 明确标识暂不可读", json.loads(b).get("error") == "config_min_version_unavailable", b)
+        check("503 未夹带配置体", "config" not in json.loads(b), b)
+        # 非法门槛 -> 422；门槛头只作用于 /proxy/config
+        s, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/config",
+                       headers={"X-Min-Version": "abc"})
+        check("非整数门槛被拒 (422)", s == 422, f"status={s}")
+        s, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo",
+                       headers={"X-Min-Version": "99"})
+        check("门槛头不影响其他转发路径", s == 200, f"status={s}")
+
+        # 18. 副本追赶：周期版本探测自动恢复候选资格（落后不算故障）
+        print("== 18. 副本追赶自动恢复候选 ==")
+        st2 = node_status("node2")
+        check("落后期间 node2 未被记为故障",
+              st2["healthy"] is True and st2["stale_count"] == 0, str(st2))
+        set_config(U2_PORT, 8)  # node2 追赶到 v8
+        time.sleep(1.6)         # 周期版本探测自动发现，无需人工干预
+        st2 = node_status("node2")
+        check("追赶后版本记录自动刷新为 8", st2["config_version"] == 8,
+              str(st2["config_version"]))
+        seen = set()
+        for _ in range(3):
+            s, h, b = get_config(min_version=6)
+            assert s == 200 and h.get("x-config-version") == "8", f"{s} {b}"
+            seen.add(json.loads(b)["node"])
+        check("门槛 6 全部落在追赶后的 node2(v8)", seen == {"node2"}, str(seen))
+
+        # 19. 排空与版本检查交错
+        print("== 19. 排空与版本检查交错 ==")
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=5")
+        check("空闲 node1 排空完成", status == 200 and json.loads(body)["drained"] is True, body)
+        set_config(U1_PORT, 30)   # 排空期间把 node1 版本调得很高
+        time.sleep(1.6)           # 跨越多轮探测
+        st1 = node_status("node1")
+        check("版本探测不打排空节点（记录仍为 5）", st1["config_version"] == 5,
+              str(st1["config_version"]))
+        check("健康探测仍覆盖排空节点", st1["healthy"] is True and st1["draining"] is True, str(st1))
+        s, _, b = get_config(min_version=10)
+        check("门槛 10 无合格节点 -> 503 而非旧版",
+              s == 503 and json.loads(b).get("error") == "config_min_version_unavailable",
+              f"{s} {b}")
+        s, h, b = get_config(min_version=6)
+        check("门槛 6 由未排空的 node2(v8) 交付",
+              s == 200 and json.loads(b)["node"] == "node2", f"{s} {b}")
+        # 在途版本请求计入排空等待
+        result19 = {}
+
+        def slow_cfg():
+            result19["status"], result19["headers"], result19["body"] = \
+                get_config(min_version=4, query="?delay=3")
+
+        t19 = threading.Thread(target=slow_cfg)
+        t19.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node2")["inflight"] != 1:
+            time.sleep(0.1)
+        check("在途版本请求已进入 node2", node_status("node2")["inflight"] == 1)
+        t0 = time.time()
+        status, _, body = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=10"
+        )
+        elapsed = time.time() - t0
+        b19 = json.loads(body)
+        t19.join(timeout=15)
+        check("排空等待在途版本请求结束 (~3s)",
+              elapsed >= 2.5 and b19.get("drained") is True, f"{elapsed:.2f}s {body}")
+        check("在途版本请求取回完整 200/v8",
+              result19.get("status") == 200
+              and result19["headers"].get("x-config-version") == "8",
+              str(result19.get("status")))
+        # 恢复后版本探测立即刷新（node1 实际已到 30）
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/resume")
+        assert status == 200
+        st1 = node_status("node1")
+        check("恢复后 node1 版本立即刷新为 30", st1["config_version"] == 30,
+              str(st1["config_version"]))
+        s, h, b = get_config(min_version=10)
+        check("门槛 10 由恢复后的 node1(v30) 交付",
+              s == 200 and json.loads(b)["node"] == "node1", f"{s} {b}")
+
+        # 17. 选路后版本回退（长探测间隔 + 手动探测，排除周期探测竞态）
+        print("== 17. 选路后版本回退：拒绝旧版并更新选路依据 ==")
+        kill(gw)
+        procs.remove(gw)
+        c2_env = dict(gw_env)
+        c2_env["PROBE_INTERVAL"] = "3600"  # 关闭周期探测，全程手动探测保证确定性
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, c2_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        check("C2 网关启动探测后两节点可接流",
+              all(node_status(n)["eligible"] for n in ("node1", "node2")))
+        set_config(U1_PORT, 5)
+        set_config(U2_PORT, 5)
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/probe")
+        assert status == 200
+        check("手动探测后两节点记录为 v5",
+              all(node_status(n)["config_version"] == 5 for n in ("node1", "node2")))
+        # 用 /proxy/echo 定位轮询指针（不影响版本记录），下一个被选中的是 other
+        _, _, b = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        first = json.loads(b)["node"]
+        other = "node2" if first == "node1" else "node1"
+        other_port = U2_PORT if other == "node2" else U1_PORT
+        first_port = U1_PORT if first == "node1" else U2_PORT
+        stale0 = node_status(other)["stale_count"]
+        fail0 = node_status(other)["failure_count"]
+        set_config(other_port, 2)   # other 实际回退到 v2；无周期探测，网关仍记 v5
+        s, h, b = get_config(min_version=4)
+        check("选路后回退的响应被拒绝并改投合格节点",
+              s == 200 and json.loads(b)["node"] == first, f"{s} {b}")
+        check("交付版本满足门槛", h.get("x-config-version") == "5", str(h))
+        st_o = node_status(other)
+        check("选路依据已更新为实际版本 2", st_o["config_version"] == 2,
+              str(st_o["config_version"]))
+        check("回退记 stale 但不算节点故障",
+              st_o["stale_count"] == stale0 + 1
+              and st_o["failure_count"] == fail0
+              and st_o["healthy"] is True,
+              str(st_o))
+        s, h, b = get_config(min_version=4)
+        check("更新后的选路依据生效（仍走合格节点）",
+              s == 200 and json.loads(b)["node"] == first, f"{s} {b}")
+        # first 也回退：所有候选实际版本都不足 -> 明确 503，不交付旧配置
+        set_config(first_port, 1)
+        s, _, b = get_config(min_version=4)
+        check("全部实际回退后返回 503 暂不可读",
+              s == 503 and json.loads(b).get("error") == "config_min_version_unavailable",
+              f"{s} {b}")
+        check("first 的记录同步为实际版本 1", node_status(first)["config_version"] == 1)
+        hits0 = sum(node_status(n)["rr_hits"] for n in ("node1", "node2"))
+        s, _, b = get_config(min_version=4)
+        hits1 = sum(node_status(n)["rr_hits"] for n in ("node1", "node2"))
+        check("无合格节点时直接 503 不再打上游", s == 503 and hits1 == hits0,
+              f"status={s} hits {hits0}->{hits1}")
+
+        # 20. 缺版本头响应：拒绝交付并排除，恢复发头后重新成为候选
+        print("== 20. 缺版本头：拒绝并自动恢复 ==")
+        set_config(U1_PORT, 5, omit=False)
+        set_config(U2_PORT, 5, omit=False)
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/probe")
+        assert status == 200
+        check("两节点恢复 v5 记录",
+              all(node_status(n)["config_version"] == 5 for n in ("node1", "node2")))
+        _, _, b = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        first = json.loads(b)["node"]
+        other = "node2" if first == "node1" else "node1"
+        other_port = U2_PORT if other == "node2" else U1_PORT
+        stale0 = node_status(other)["stale_count"]
+        set_config(other_port, 5, omit=True)   # 版本不变但不再发版本头
+        s, h, b = get_config(min_version=4)
+        check("缺版本响应被拒绝并改投合格节点",
+              s == 200 and json.loads(b)["node"] == first, f"{s} {b}")
+        check("交付响应带版本头", h.get("x-config-version") == "5", str(h))
+        st_o = node_status(other)
+        check("缺版本节点记录清空并被排除",
+              st_o["config_version"] is None and st_o["stale_count"] == stale0 + 1,
+              str(st_o))
+        check("缺版本不算节点故障", st_o["healthy"] is True, str(st_o))
+        set_config(other_port, 5, omit=False)
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/probe")
+        assert status == 200
+        check("恢复发头后重新成为候选", node_status(other)["config_version"] == 5)
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0
